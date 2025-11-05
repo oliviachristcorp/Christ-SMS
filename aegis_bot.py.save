@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+import os, json, time, re, hashlib
+import requests, pyotp
+
+# === НАСТРОЙКИ ===
+TOKEN = "8597122120:AAGUp_Zerivg4swO39_V8_prjmzYBtsAakA"
+ADMINS = {6171834060}
+
+ROOT = os.path.expanduser("~/Christ SMS")
+
+# Файлы состояния
+ALLOWED_PATH = os.path.join(ROOT, "allowed_chats.json")
+DISABLED_PATH = os.path.join(ROOT, "disabled_chats.json")
+LABELS_PATH = os.path.join(ROOT, "users_labels.json")
+
+# База Aegis
+AEGIS_JSON_PATH = os.path.join(ROOT, "aegis-export-plain-20251101-015408.json")
+AEGIS_LATEST_PATH = os.path.join(ROOT, "aegis-export-latest.json")
+
+ACCOUNTS = []
+
+# ===== Работа с отключёнными пользователями =====
+def disabled_map():
+    data = load_json(DISABLED_PATH, default={})
+    # если вдруг файл почему-то оказался списком — конвертнём в словарь
+    if isinstance(data, list):
+        data = {str(x): True for x in data}
+        save_json(DISABLED_PATH, data)
+    elif not isinstance(data, dict):
+        data = {}
+        save_json(DISABLED_PATH, data)
+    return data
+
+def save_disabled_map(m):
+    save_json(DISABLED_PATH, m)
+
+def is_disabled(chat_id: int) -> bool:
+    return bool(disabled_map().get(str(chat_id)))
+
+def disable_user(chat_id: int) -> None:
+    m = disabled_map()
+    m[str(chat_id)] = True
+    save_disabled_map(m)
+
+def enable_user(chat_id: int) -> None:
+    m = disabled_map()
+    if str(chat_id) in m:
+        del m[str(chat_id)]
+    save_disabled_map(m)
+
+# === Утилиты ===
+def _read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(default, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return json.loads(json.dumps(default))
+
+
+def _write_json(path, obj):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def allowed_list():
+    data = _read_json(ALLOWED_PATH, [])
+    if isinstance(data, dict):
+        data = [int(k) for k, v in data.items() if v]
+        _write_json(ALLOWED_PATH, data)
+    return data
+
+
+def set_allowed_list(lst):
+    _write_json(ALLOWED_PATH, list(sorted(set(lst))))
+
+
+def disabled_map():
+    data = _read_json(DISABLED_PATH, {})
+    if isinstance(data, list):
+        data = {str(x): True for x in data}
+        _write_json(DISABLED_PATH, data)
+    return data
+
+
+def labels_map():
+    data = _read_json(LABELS_PATH, {})
+    if not isinstance(data, dict):
+        data = {}
+        _write_json(LABELS_PATH, data)
+    return data
+
+
+def set_disabled(chat_id, value):
+    m = disabled_map()
+    if value:
+        m[str(chat_id)] = True
+    else:
+        m.pop(str(chat_id), None)
+    _write_json(DISABLED_PATH, m)
+
+
+def set_label(chat_id, label):
+    m = labels_map()
+    m[str(chat_id)] = label.strip()
+    _write_json(LABELS_PATH, m)
+
+
+def is_allowed(chat_id):
+    return int(chat_id) in set(allowed_list())
+
+
+def is_disabled(chat_id):
+    return disabled_map().get(str(chat_id), False)
+
+
+def send_msg(chat_id, text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=20,
+        )
+    except Exception:
+        pass
+
+
+# === Работа с Aegis ===
+def digest_from_algo(algo):
+    return {
+        "SHA1": hashlib.sha1,
+        "SHA256": hashlib.sha256,
+        "SHA512": hashlib.sha512,
+    }.get((algo or "SHA1").upper(), hashlib.sha1)
+
+
+def load_accounts(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    entries = (
+        data.get("db", {}).get("entries")
+        or data.get("entries")
+        or data.get("accounts")
+        or []
+    )
+
+    accs = []
+    for e in entries:
+        info = e.get("info") or {}
+        secret = info.get("secret") or e.get("secret") or (e.get("data") or {}).get("secret")
+        if not secret:
+            continue
+        accs.append(
+            {
+                "secret": secret,
+                "name": (e.get("name") or info.get("name") or "").strip(),
+                "issuer": (e.get("issuer") or info.get("issuer") or "").strip(),
+                "digits": int(info.get("digits") or e.get("digits") or 6),
+                "period": int(info.get("period") or e.get("period") or 30),
+                "algo": (info.get("algo") or e.get("algo") or "SHA1").upper(),
+            }
+        )
+    return accs
+
+
+def gen_code(entry):
+    totp = pyotp.TOTP(
+        s=entry["secret"],
+        digits=entry["digits"],
+        interval=entry["period"],
+        digest=digest_from_algo(entry["algo"]),
+    )
+    return totp.now()
+
+
+def find_entry(label):
+    q = label.strip()
+    if not q:
+        return None
+    pattern = re.compile(rf"^{re.escape(q)}($|[\s:/\-])", re.IGNORECASE)
+    for e in ACCOUNTS:
+        if pattern.search(e["name"]):
+            return e
+    return None
+
+
+# === Основной обработчик ===
+def handle_text(chat_id, text):
+    global ACCOUNTS, AEGIS_JSON_PATH
+
+    low = (text or "").strip().lower()
+
+    # --- ВАЖНО: всё, что начинается с '/', считаем командой и НИКОГДА не ищем как метку
+    if low.startswith("/"):
+        # Определяем, админ ли отправитель. В личке chat_id == твоему id,
+        # в группе полезно проверить ещё from.id (если ты это добавлял в main).
+        is_admin = (chat_id in ADMINS)
+
+        # /start /help показываем всем
+        if low in ("/start", "/help", "/?"):
+            send_msg(chat_id, "Отправь мне номер гос для получения кода (Пример: 123.1)")
+            return
+
+        # Все остальные команды — только админу
+        if not is_admin:
+            send_msg(chat_id, "Доступ запрещён.")
+            return
+
+        # ---- команды администратора ----
+        if low.startswith("/reload"):
+            ACCOUNTS = load_accounts(AEGIS_JSON_PATH)
+            send_msg(chat_id, f"Перезагружено. Всего записей: {len(ACCOUNTS)}")
+            return
+
+        if low.startswith("/allow"):
+            parts = low.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                add_allowed(int(parts[1]))
+                send_msg(chat_id, f"Добавлен: {parts[1]}")
+            else:
+                send_msg(chat_id, "Формат: /allow <chat_id>")
+            return
+
+        if low.startswith("/unallow"):
+            parts = low.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                remove_allowed(int(parts[1]))
+                send_msg(chat_id, f"Удалён: {parts[1]}")
+            else:
+                send_msg(chat_id, "Формат: /unallow <chat_id>")
+            return
+
+if low.startswith("/allow"):
+    parts = low.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        add_allowed(int(parts[1]))
+        send_msg(chat_id, f"Добавлен: {parts[1]}")
+    else:
+        send_msg(chat_id, "Формат: /allow <chat_id>")
+    return
+
+if low.startswith("/unallow"):
+    parts = low.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        remove_allowed(int(parts[1]))
+        send_msg(chat_id, f"Удалён: {parts[1]}")
+    else:
+        send_msg(chat_id, "Формат: /unallow <chat_id>")
+    return
+
+if low.startswith("/leave"):
+    parts = low.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        user_id = int(parts[1])
+        disabled = _read_json(DISABLED_PATH, [])
+        if user_id not in disabled:
+            disabled.append(user_id)
+            with open(DISABLED_PATH, "w", encoding="utf-8") as f:
+                json.dump(disabled, f, ensure_ascii=False, indent=2)
+        send_msg(chat_id, f"Отключён: {parts[1]}")
+    else:
+        send_msg(chat_id, "Формат: /leave <chat_id>")
+    return
+
+	if low.startswith("/join"):
+    parts = low.split()
+	if len(parts) >= 2 and parts[1].isdigit():
+        user_id = int(parts[1])
+        disabled = _read_json(DISABLED_PATH, [])
+        if user_id in disabled:
+            disabled.remove(user_id)
+            with open(DISABLED_PATH, "w", encoding="utf-8") as f:
+                json.dump(disabled, f, ensure_ascii=False, indent=2)
+        send_msg(chat_id, f"Подключён: {parts[1]}")
+    else:
+        send_msg(chat_id, "Формат: /join <chat_id>")
+    return
+
+        if low.startswith("/label"):
+            parts = text.split(maxsplit=2)
+             if len(parts) >= 3 and parts[1].isdigit():
+                set_label(int(parts[1]), parts[2])
+                send_msg(chat_id, "Ок.")
+            else:
+                send_msg(chat_id, "Формат: /label <chat_id> <имя>")
+            return
+
+        if low.startswith("/list"):
+            lines = []
+            for cid in allowed_list():
+                name = labels_map().get(str(cid), "")
+                status = "OFF" if is_disabled(cid) else "ON"
+                lines.append(f"{cid} {name} [{status}]")
+            send_msg(chat_id, "Участники:\n" + ("\n".join(lines) if lines else "пусто"))
+            return
+
+        # неизвестная команда — просто молча выходим
+        return
+    # --- конец командного блока ---
+
+    # дальше обычный режим поиска метки:
+    entry = find_entry(text)
+    if not entry:
+        send_msg(chat_id, "Код не найден.")
+        return
+    code = gen_code(entry)
+    send_msg(chat_id, f"{code}")
+
+# === Главная петля ===
+def main():
+    global ACCOUNTS, AEGIS_JSON_PATH  # ← исправлено, теперь обе объявлены до использования
+
+    os.makedirs(ROOT, exist_ok=True)
+    _ = allowed_list()
+    _ = disabled_map()
+    _ = labels_map()
+
+    ACCOUNTS = load_accounts(AEGIS_JSON_PATH)
+    print(f"Бот запущен. Всего записей: {len(ACCOUNTS)}")
+
+    offset = None
+    while True:
+        try:
+            updates = requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                params={"timeout": 50, "offset": offset},
+                timeout=60,
+            ).json()
+        except Exception:
+            time.sleep(2)
+            continue
+
+        for u in updates.get("result", []):
+            offset = u["update_id"] + 1
+            msg = u.get("message")
+            if not msg:
+                continue
+            chat_id = msg["chat"]["id"]
+
+            if chat_id not in ADMINS and not is_allowed(chat_id):
+                send_msg(chat_id, "Доступ запрещён.")
+                continue
+
+            if is_disabled(chat_id):
+                continue
+
+            if msg.get("document") and chat_id in ADMINS:
+                try:
+                    file_id = msg["document"]["file_id"]
+                    info = requests.get(
+                        f"https://api.telegram.org/bot{TOKEN}/getFile",
+                        params={"file_id": file_id},
+                    ).json()
+                    file_path = info["result"]["file_path"]
+                    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+                    data = requests.get(url).content
+                    with open(AEGIS_LATEST_PATH, "wb") as f:
+                        f.write(data)
+                    AEGIS_JSON_PATH = AEGIS_LATEST_PATH
+                    ACCOUNTS = load_accounts(AEGIS_JSON_PATH)
+                    send_msg(chat_id, "База обновлена.")
+                except Exception as e:
+                    send_msg(chat_id, f"Ошибка: {e}")
+                continue
+
+            text = msg.get("text", "").strip()
+            if text:
+                handle_text(chat_id, text)
+        time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()
